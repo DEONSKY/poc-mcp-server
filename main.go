@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -16,41 +17,74 @@ import (
 type Product struct {
 	gorm.Model
 	Code  string
-	Price uint
+	Price float64 // Changed to float64 for consistency with calculator
 }
 
-// DB is a global database instance
-var DB *gorm.DB
+// DBService encapsulates database operations
+type DBService struct {
+	db *gorm.DB
+}
+
+// NewDBService creates a new database service
+func NewDBService(db *gorm.DB) *DBService {
+	return &DBService{db: db}
+}
+
+// GetProducts retrieves all products from the database
+func (dbs *DBService) GetProducts() ([]Product, error) {
+	var products []Product
+	if err := dbs.db.Find(&products).Error; err != nil {
+		return nil, fmt.Errorf("failed to retrieve products: %w", err)
+	}
+	return products, nil
+}
+
+// App holds the application components
+type App struct {
+	dbService *DBService
+}
+
+// NewApp creates a new application instance
+func NewApp(dbService *DBService) *App {
+	return &App{
+		dbService: dbService,
+	}
+}
 
 // initializeDatabase initializes the SQLite database and performs migrations
-func initializeDatabase() error {
-	var err error
-	DB, err = gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+func initializeDatabase() (*gorm.DB, error) {
+	// Get database path from environment variable or use default
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "test.db"
+	}
+
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
-		return fmt.Errorf("failed to connect database: %w", err)
+		return nil, fmt.Errorf("failed to connect database: %w", err)
 	}
 
 	// Migrate the schema
-	if err := DB.AutoMigrate(&Product{}); err != nil {
-		return fmt.Errorf("failed to migrate database: %w", err)
+	if err := db.AutoMigrate(&Product{}); err != nil {
+		return nil, fmt.Errorf("failed to migrate database: %w", err)
 	}
 
-	return nil
+	return db, nil
 }
 
 // seedDatabase creates sample products if the database is empty
-func seedDatabase() error {
+func seedDatabase(db *gorm.DB) error {
 	var count int64
-	DB.Model(&Product{}).Count(&count)
+	db.Model(&Product{}).Count(&count)
 
 	if count == 0 {
 		// Create some sample products
 		products := []Product{
-			{Code: "D42", Price: 100},
-			{Code: "P99", Price: 200},
+			{Code: "D42", Price: 100.00},
+			{Code: "P99", Price: 200.00},
 		}
 
-		if err := DB.CreateInBatches(products, len(products)).Error; err != nil {
+		if err := db.CreateInBatches(products, len(products)).Error; err != nil {
 			return fmt.Errorf("failed to seed database: %w", err)
 		}
 
@@ -61,7 +95,7 @@ func seedDatabase() error {
 }
 
 // helloHandler handles the hello_world tool request
-func helloHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (app *App) helloHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	name, err := request.RequireString("name")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -71,10 +105,10 @@ func helloHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallTo
 }
 
 // listProductsHandler handles the products resource request
-func listProductsHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-	var products []Product
-	if err := DB.Find(&products).Error; err != nil {
-		return nil, fmt.Errorf("failed to retrieve products: %w", err)
+func (app *App) listProductsHandler(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	products, err := app.dbService.GetProducts()
+	if err != nil {
+		return nil, err
 	}
 
 	jsonData, err := json.MarshalIndent(products, "", "  ")
@@ -92,7 +126,7 @@ func listProductsHandler(ctx context.Context, request mcp.ReadResourceRequest) (
 }
 
 // calculateHandler handles the calculate tool request
-func calculateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (app *App) calculateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	// Using helper functions for type-safe argument access
 	op, err := request.RequireString("operation")
 	if err != nil {
@@ -130,7 +164,7 @@ func calculateHandler(ctx context.Context, request mcp.CallToolRequest) (*mcp.Ca
 }
 
 // setupServer creates and configures the MCP server with tools and resources
-func setupServer() *server.MCPServer {
+func (app *App) setupServer() *server.MCPServer {
 	// Create a new MCP server
 	s := server.NewMCPServer(
 		"Demo",
@@ -146,13 +180,13 @@ func setupServer() *server.MCPServer {
 			mcp.Description("Name of the person to greet"),
 		),
 	)
-	s.AddTool(helloTool, helloHandler)
+	s.AddTool(helloTool, app.helloHandler)
 
 	// Add products resource for listing products
 	productsResource := mcp.NewResource("products://list", "Product List",
 		mcp.WithResourceDescription("Lists all available products"),
 	)
-	s.AddResource(productsResource, listProductsHandler)
+	s.AddResource(productsResource, app.listProductsHandler)
 
 	// Add calculator tool
 	calculatorTool := mcp.NewTool("calculate",
@@ -171,24 +205,29 @@ func setupServer() *server.MCPServer {
 			mcp.Description("Second number"),
 		),
 	)
-	s.AddTool(calculatorTool, calculateHandler)
+	s.AddTool(calculatorTool, app.calculateHandler)
 
 	return s
 }
 
 func main() {
 	// Initialize database
-	if err := initializeDatabase(); err != nil {
+	db, err := initializeDatabase()
+	if err != nil {
 		log.Fatalf("Database initialization failed: %v", err)
 	}
 
 	// Seed database with sample data
-	if err := seedDatabase(); err != nil {
+	if err := seedDatabase(db); err != nil {
 		log.Printf("Warning: Database seeding failed: %v", err)
 	}
 
+	// Create services and application
+	dbService := NewDBService(db)
+	app := NewApp(dbService)
+
 	// Setup and start the MCP server
-	s := setupServer()
+	s := app.setupServer()
 
 	log.Println("Starting MCP server...")
 	if err := server.ServeStdio(s); err != nil {
